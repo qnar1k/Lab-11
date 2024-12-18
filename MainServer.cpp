@@ -1,47 +1,125 @@
-#include <stdio.h>
-#include "UDPServer.h"
+#include <iostream>
+#include <cstring>
+#include <string>
+#include <thread>
+#include <ws2tcpip.h>
 #include <winsock2.h>
-#include <ws2tcpip.h>  // Include for inet_ntop()
+#include <mutex>
+#include "UDPServer.h"
 
-#define BUFLEN 1024  // Max length of buffer
+#define PORT 8888  
+#define BUFLEN 512
+#pragma comment(lib, "ws2_32.lib")
 
-int main(int argc, char* argv[]) {
+
+std::mutex recv_lock; 
+bool quitnow = false;
+
+
+void LockThread(std::mutex& lock) {
+    lock.lock();  
+}
+
+
+void UnlockThread(std::mutex& lock) {
+    lock.unlock();  
+}
+
+
+void handleClient(UDPServer& server) {
     struct sockaddr_in si_other;
-    unsigned short srvport;
-    int slen;
+    int slen = sizeof(si_other);
     char buf[BUFLEN];
-    char msg[BUFLEN];
+    char ipStr[INET_ADDRSTRLEN];
 
-    srvport = (1 == argc) ? PORT : atoi(argv[1]);
+    while (!quitnow) {
+        int receivedBytes = server.RecvDatagram(buf, BUFLEN, (struct sockaddr*)&si_other, &slen);
+        if (receivedBytes > 0) {
+            buf[receivedBytes] = '\0'; 
+            inet_ntop(AF_INET, &si_other.sin_addr, ipStr, INET_ADDRSTRLEN);
 
-    // Initialize server socket
-    UDPServer server(srvport);
-    slen = sizeof(si_other);
+    
+            LockThread(recv_lock);
 
-    printf("Waiting for data...\n");
+            std::cout << "Received packet from " << ipStr << ":" << ntohs(si_other.sin_port) << std::endl;
+            std::cout << "Data: " << buf << std::endl;
 
-    // Keep listening for data
-    while (1) {
-        memset(buf, '\0', BUFLEN);  // Clear buffer before receiving data
+            UnlockThread(recv_lock);
 
-        // Receive data (blocking call)
-        server.RecvDatagram(buf, BUFLEN, (struct sockaddr*)&si_other, &slen);
+          
+            std::string response = "Received message: " + std::string(buf);
+            std::cout << "Sending response: " << response << std::endl;
 
-        // Use inet_ntop to convert the binary IP address to a text representation
-        char ipStr[INET_ADDRSTRLEN];  // Create a buffer to store the IP string
-        inet_ntop(AF_INET, &si_other.sin_addr, ipStr, sizeof(ipStr));  // Use inet_ntop instead of inet_ntoa
+            int sentBytes = server.SendDatagram(response.c_str(), response.length(), (struct sockaddr*)&si_other, slen);
+            if (sentBytes == -1) {
+                std::cerr << "Failed to send response. Error code: " << WSAGetLastError() << std::endl;
+            }
 
-        // Print received data and client info
-        printf("Received packet from %s:%d\n", ipStr, ntohs(si_other.sin_port));
-        printf("Data: %s\n", buf);
+       
+            std::string prompt = "Enter a text: ";
+            server.SendDatagram(prompt.c_str(), prompt.length(), (struct sockaddr*)&si_other, slen);
+        }
+        else {
+            std::cerr << "Failed to receive data. Error code: " << WSAGetLastError() << std::endl;
+        }
+    }
+}
 
-        // Ask server operator to provide a reply
-        printf("\nAnswer: ");
-        gets_s(msg, BUFLEN);
+int main() {
+    WSADATA wsa;
+    SOCKET serverSock;
+    struct sockaddr_in serverAddr, clientAddr;
+    char buffer[BUFLEN];
+    int slen = sizeof(clientAddr);
 
-        // Send response back to client
-        server.SendDatagram(msg, (int)strlen(msg), (struct sockaddr*)&si_other, slen);
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::cerr << "WSAStartup failed with error: " << WSAGetLastError() << std::endl;
+        return 1;
     }
 
+
+    serverSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (serverSock == INVALID_SOCKET) {
+        std::cerr << "Socket creation failed with error: " << WSAGetLastError() << std::endl;
+        WSACleanup();
+        return 1;
+    }
+
+
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(PORT);
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+
+  
+    if (bind(serverSock, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "Bind failed with error: " << WSAGetLastError() << std::endl;
+        closesocket(serverSock);
+        WSACleanup();
+        return 1;
+    }
+
+    std::cout << "Server listening on port " << PORT << "...\n";
+
+  
+    UDPServer server(serverSock);
+    std::thread clientHandler(handleClient, std::ref(server));
+
+    
+    while (!quitnow) {
+        std::string userInput;
+        LockThread(recv_lock);
+        std::getline(std::cin, userInput);  
+        const char* response = userInput.c_str();
+        sendto(serverSock, response, userInput.length(), 0, (struct sockaddr*)&clientAddr, slen);
+        UnlockThread(recv_lock); 
+    }
+
+
+    quitnow = true;
+    clientHandler.join();  
+
+    closesocket(serverSock);
+    WSACleanup();
     return 0;
 }
